@@ -229,6 +229,18 @@ function buildUsageLicense(
   return license;
 }
 
+function getUnavailableReason(
+  license?: LicenseInfo,
+  fetched?: LicensedFetchResult
+): string | null {
+  if (license?.action === 'deny') return 'license denied';
+  if (fetched?.status === 401 || fetched?.status === 403) {
+    return `blocked (${fetched.status})`;
+  }
+  if (fetched?.status === 402) return 'payment required';
+  return null;
+}
+
 function extractDocumentText(doc: any): string {
   if (!doc) return '';
   if (doc.markdown) return String(doc.markdown);
@@ -241,6 +253,17 @@ function extractDocumentText(doc: any): string {
   return '';
 }
 
+function redactResultFields<T extends Record<string, any>>(item: T, reason: string): T {
+  const cleaned: T = { ...item, unavailable: reason };
+  const fields = ['markdown', 'html', 'rawHtml', 'text', 'content'];
+  for (const field of fields) {
+    if (field in cleaned) {
+      cleaned[field] = `UNAVAILABLE: ${reason}`;
+    }
+  }
+  return cleaned;
+}
+
 async function logUsageFromContent(
   url: string,
   content: string,
@@ -248,7 +271,7 @@ async function logUsageFromContent(
   stage: LicenseStage,
   distribution: Distribution
 ): Promise<void> {
-  if (!license) return;
+  if (!license || license.action === 'deny') return;
   const tokens = licenseService.estimateTokens(content);
   if (tokens === 0) return;
   await licenseService.logUsage(url, tokens, license, stage, distribution);
@@ -404,6 +427,7 @@ ${
     } as any);
     const license = await licenseService.checkLicense(String(url));
     let fetched: LicensedFetchResult | undefined;
+    let unavailableReason: string | null = null;
 
     if (licenseOpts.fetch) {
       fetched = await licensedFetchText(String(url), {
@@ -414,18 +438,33 @@ ${
         maxChars: licenseOpts.maxChars,
         paymentMethod: licenseOpts.paymentMethod
       });
+      unavailableReason = getUnavailableReason(license, fetched);
+      if (unavailableReason && fetched) {
+        fetched.content_text = undefined;
+      }
 
-      if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
+      if (!unavailableReason && fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
         const usageLicense = buildUsageLicense(String(url), license, fetched);
         await logUsageFromContent(String(url), fetched.content_text, usageLicense, licenseOpts.stage, licenseOpts.distribution);
       }
     } else {
       const content = extractDocumentText((res as any)?.data ?? res);
-      await logUsageFromContent(String(url), content, license, licenseOpts.stage, licenseOpts.distribution);
+      unavailableReason = getUnavailableReason(license);
+      if (!unavailableReason) {
+        await logUsageFromContent(String(url), content, license, licenseOpts.stage, licenseOpts.distribution);
+      }
     }
 
-    if (licenseOpts.includeLicenses || licenseOpts.fetch) {
+    if (licenseOpts.includeLicenses || licenseOpts.fetch || unavailableReason) {
       const payload: any = typeof res === 'object' && res !== null ? { ...(res as any) } : { data: res };
+      if (unavailableReason) {
+        if (payload.data && typeof payload.data === 'object') {
+          payload.data = redactResultFields(payload.data as any, unavailableReason);
+        } else {
+          return asText(redactResultFields(payload as any, unavailableReason));
+        }
+        payload.unavailable = unavailableReason;
+      }
       payload.license = license;
       if (licenseOpts.fetch) payload.fetched = fetched;
       payload.usage_log = licenseService.getSessionSummary();
@@ -586,9 +625,15 @@ The query also supports search operators, that you can use if needed to refine t
     const urls = results.map((r: any) => r.url).filter(Boolean);
     const licenses = await licenseService.checkLicenseBatch(urls);
     const fetchedByUrl: Record<string, LicensedFetchResult> = {};
+    const blockedByUrl = new Map<string, string>();
 
     if (licenseOpts.fetch) {
       for (const url of urls) {
+        const preBlock = getUnavailableReason(licenses.get(url));
+        if (preBlock) {
+          blockedByUrl.set(url, preBlock);
+          continue;
+        }
         const fetched = await licensedFetchText(url, {
           ledger: licenseService,
           stage: licenseOpts.stage,
@@ -599,7 +644,11 @@ The query also supports search operators, that you can use if needed to refine t
         });
         fetchedByUrl[url] = fetched;
 
-        if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
+        const blocked = getUnavailableReason(licenses.get(url), fetched);
+        if (blocked) {
+          blockedByUrl.set(url, blocked);
+          fetched.content_text = undefined;
+        } else if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
           const usageLicense = buildUsageLicense(url, licenses.get(url), fetched);
           await logUsageFromContent(url, fetched.content_text, usageLicense, licenseOpts.stage, licenseOpts.distribution);
         }
@@ -607,6 +656,11 @@ The query also supports search operators, that you can use if needed to refine t
     } else {
       for (const resultItem of results) {
         const license = licenses.get(resultItem.url);
+        const blocked = getUnavailableReason(license);
+        if (blocked) {
+          blockedByUrl.set(resultItem.url, blocked);
+          continue;
+        }
         if (license) {
           await logUsageFromContent(
             resultItem.url,
@@ -619,18 +673,32 @@ The query also supports search operators, that you can use if needed to refine t
       }
     }
 
-    if (licenseOpts.includeLicenses || licenseOpts.fetch) {
+    const hasBlocked = blockedByUrl.size > 0;
+    if (licenseOpts.includeLicenses || licenseOpts.fetch || hasBlocked) {
       const payload: any = typeof res === 'object' && res !== null ? { ...(res as any) } : { data: res };
       payload.licenses = results.map((r: any) => {
         const fetched = fetchedByUrl[r.url];
-        const content = fetched?.content_text || extractDocumentText(r);
+        const blocked = blockedByUrl.get(r.url);
+        const content = blocked ? '' : (fetched?.content_text || extractDocumentText(r));
         return {
           url: r.url,
+          unavailable: blocked || undefined,
           tokens: licenseService.estimateTokens(content),
           license: licenses.get(r.url),
           fetched: licenseOpts.fetch ? fetched : undefined
         };
       });
+      if (Array.isArray(payload.data?.results)) {
+        payload.data.results = payload.data.results.map((r: any) => {
+          const blocked = blockedByUrl.get(r.url);
+          return blocked ? redactResultFields(r, blocked) : r;
+        });
+      } else if (Array.isArray(payload.results)) {
+        payload.results = payload.results.map((r: any) => {
+          const blocked = blockedByUrl.get(r.url);
+          return blocked ? redactResultFields(r, blocked) : r;
+        });
+      }
       payload.usage_log = licenseService.getSessionSummary();
       return asText(payload);
     }
@@ -759,9 +827,15 @@ Check the status of a crawl job.
         .filter(Boolean);
       const licenses = await licenseService.checkLicenseBatch(urls);
       const fetchedByUrl: Record<string, LicensedFetchResult> = {};
+      const blockedByUrl = new Map<string, string>();
 
       if (licenseOpts.fetch) {
         for (const url of urls) {
+          const preBlock = getUnavailableReason(licenses.get(url));
+          if (preBlock) {
+            blockedByUrl.set(url, preBlock);
+            continue;
+          }
           const fetched = await licensedFetchText(url, {
             ledger: licenseService,
             stage: licenseOpts.stage,
@@ -772,7 +846,11 @@ Check the status of a crawl job.
           });
           fetchedByUrl[url] = fetched;
 
-          if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
+          const blocked = getUnavailableReason(licenses.get(url), fetched);
+          if (blocked) {
+            blockedByUrl.set(url, blocked);
+            fetched.content_text = undefined;
+          } else if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
             const usageLicense = buildUsageLicense(url, licenses.get(url), fetched);
             await logUsageFromContent(url, fetched.content_text, usageLicense, licenseOpts.stage, licenseOpts.distribution);
           }
@@ -781,6 +859,11 @@ Check the status of a crawl job.
         for (const page of pages) {
           const pageUrl = page.url || page.metadata?.url;
           const license = licenses.get(pageUrl);
+          const blocked = getUnavailableReason(license);
+          if (blocked) {
+            blockedByUrl.set(pageUrl, blocked);
+            continue;
+          }
           if (license) {
             await logUsageFromContent(
               pageUrl,
@@ -793,19 +876,35 @@ Check the status of a crawl job.
         }
       }
 
-      if (licenseOpts.includeLicenses || licenseOpts.fetch) {
+      const hasBlocked = blockedByUrl.size > 0;
+      if (licenseOpts.includeLicenses || licenseOpts.fetch || hasBlocked) {
         const payload: any = typeof res === 'object' && res !== null ? { ...(res as any) } : { data: res };
         payload.licenses = pages.map((page: any) => {
           const pageUrl = page.url || page.metadata?.url;
           const fetched = fetchedByUrl[pageUrl];
-          const content = fetched?.content_text || extractDocumentText(page);
+          const blocked = blockedByUrl.get(pageUrl);
+          const content = blocked ? '' : (fetched?.content_text || extractDocumentText(page));
           return {
             url: pageUrl,
+            unavailable: blocked || undefined,
             tokens: licenseService.estimateTokens(content),
             license: licenses.get(pageUrl),
             fetched: licenseOpts.fetch ? fetched : undefined
           };
         });
+        if (Array.isArray(payload.data?.pages)) {
+          payload.data.pages = payload.data.pages.map((page: any) => {
+            const pageUrl = page.url || page.metadata?.url;
+            const blocked = blockedByUrl.get(pageUrl);
+            return blocked ? redactResultFields(page, blocked) : page;
+          });
+        } else if (Array.isArray(payload.pages)) {
+          payload.pages = payload.pages.map((page: any) => {
+            const pageUrl = page.url || page.metadata?.url;
+            const blocked = blockedByUrl.get(pageUrl);
+            return blocked ? redactResultFields(page, blocked) : page;
+          });
+        }
         payload.usage_log = licenseService.getSessionSummary();
         return asText(payload);
       }
@@ -892,9 +991,15 @@ Extract structured information from web pages using LLM capabilities. Supports b
     const urls = Array.isArray(a.urls) ? (a.urls as string[]) : [];
     const licenses = await licenseService.checkLicenseBatch(urls);
     const fetchedByUrl: Record<string, LicensedFetchResult> = {};
+    const blockedByUrl = new Map<string, string>();
 
     if (licenseOpts.fetch) {
       for (const url of urls) {
+        const preBlock = getUnavailableReason(licenses.get(url));
+        if (preBlock) {
+          blockedByUrl.set(url, preBlock);
+          continue;
+        }
         const fetched = await licensedFetchText(url, {
           ledger: licenseService,
           stage: licenseOpts.stage,
@@ -905,7 +1010,11 @@ Extract structured information from web pages using LLM capabilities. Supports b
         });
         fetchedByUrl[url] = fetched;
 
-        if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
+        const blocked = getUnavailableReason(licenses.get(url), fetched);
+        if (blocked) {
+          blockedByUrl.set(url, blocked);
+          fetched.content_text = undefined;
+        } else if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
           const usageLicense = buildUsageLicense(url, licenses.get(url), fetched);
           await logUsageFromContent(url, fetched.content_text, usageLicense, licenseOpts.stage, licenseOpts.distribution);
         }
@@ -916,6 +1025,11 @@ Extract structured information from web pages using LLM capabilities. Supports b
       for (const item of Array.isArray(results) ? results : []) {
         const itemUrl = item.url || item.sourceUrl;
         const license = licenses.get(itemUrl);
+        const blocked = getUnavailableReason(license);
+        if (blocked) {
+          blockedByUrl.set(itemUrl, blocked);
+          continue;
+        }
         if (license) {
           await logUsageFromContent(
             itemUrl,
@@ -928,18 +1042,34 @@ Extract structured information from web pages using LLM capabilities. Supports b
       }
     }
 
-    if (licenseOpts.includeLicenses || licenseOpts.fetch) {
+    const hasBlocked = blockedByUrl.size > 0;
+    if (licenseOpts.includeLicenses || licenseOpts.fetch || hasBlocked) {
       const payload: any = typeof res === 'object' && res !== null ? { ...(res as any) } : { data: res };
       payload.licenses = urls.map((url: string) => {
         const fetched = fetchedByUrl[url];
-        const content = fetched?.content_text || '';
+        const blocked = blockedByUrl.get(url);
+        const content = blocked ? '' : (fetched?.content_text || '');
         return {
           url,
+          unavailable: blocked || undefined,
           tokens: licenseService.estimateTokens(content),
           license: licenses.get(url),
           fetched: licenseOpts.fetch ? fetched : undefined
         };
       });
+      if (Array.isArray(payload.data?.data)) {
+        payload.data.data = payload.data.data.map((item: any) => {
+          const itemUrl = item.url || item.sourceUrl;
+          const blocked = blockedByUrl.get(itemUrl);
+          return blocked ? redactResultFields(item, blocked) : item;
+        });
+      } else if (Array.isArray(payload.data?.results)) {
+        payload.data.results = payload.data.results.map((item: any) => {
+          const itemUrl = item.url || item.sourceUrl;
+          const blocked = blockedByUrl.get(itemUrl);
+          return blocked ? redactResultFields(item, blocked) : item;
+        });
+      }
       payload.usage_log = licenseService.getSessionSummary();
       return asText(payload);
     }
