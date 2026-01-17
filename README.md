@@ -6,9 +6,28 @@
   >
 </div>
 
-# Firecrawl MCP Server
+# Firecrawl MCP Server (Licensed Fork)
 
 A Model Context Protocol (MCP) server implementation that integrates with [Firecrawl](https://github.com/firecrawl/firecrawl) for web scraping capabilities.
+
+## Licensed Fork
+
+This repo is a fork of `firecrawl/firecrawl-mcp-server` with Copyright.sh licensing:
+- automatic `ai-license` discovery
+- optional x402-aware fetch (402 + `payment-required: x402`)
+- usage logging to the Copyright.sh ledger for compensation/audit
+
+When following upstream install instructions, replace `firecrawl-mcp` with `firecrawl-mcp-server-licensed` and add the ledger env vars below.
+
+### Licensing env vars
+
+- `COPYRIGHTSH_LEDGER_API` (default: `https://ledger.copyright.sh`)
+- `COPYRIGHTSH_LEDGER_API_KEY` (recommended for acquire + usage logging)
+- `ENABLE_LICENSE_TRACKING` (default: `true`)
+- `ENABLE_LICENSE_CACHE` (default: `false`)
+
+License-aware options (for scrape/search/extract/check_crawl_status):
+- `fetch`, `include_licenses`, `stage`, `distribution`, `estimated_tokens`, `max_chars`, `payment_method`
 
 > Big thanks to [@vrknetha](https://github.com/vrknetha), [@knacklabs](https://www.knacklabs.ai) for the initial implementation!
 
@@ -28,13 +47,13 @@ A Model Context Protocol (MCP) server implementation that integrates with [Firec
 ### Running with npx
 
 ```bash
-env FIRECRAWL_API_KEY=fc-YOUR_API_KEY npx -y firecrawl-mcp
+env FIRECRAWL_API_KEY=fc-YOUR_API_KEY npx -y firecrawl-mcp-server-licensed
 ```
 
 ### Manual Installation
 
 ```bash
-npm install -g firecrawl-mcp
+npm install -g firecrawl-mcp-server-licensed
 ```
 
 ### Running on Cursor

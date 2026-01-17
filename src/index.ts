@@ -4,6 +4,9 @@ import { FastMCP, type Logger } from 'firecrawl-fastmcp';
 import { z } from 'zod';
 import FirecrawlApp from '@mendable/firecrawl-js';
 import type { IncomingHttpHeaders } from 'http';
+import { getLicenseService } from './services/license-service.js';
+import { licensedFetchText } from './services/licensed-fetcher.js';
+import type { Distribution, LicenseStage, LicensedFetchResult, LicenseInfo } from './types.js';
 
 dotenv.config({ debug: false, quiet: true });
 
@@ -119,6 +122,14 @@ const server = new FastMCP<SessionData>({
   },
 });
 
+const shutdown = () => {
+  licenseService.cleanup();
+  process.exit(0);
+};
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
 function createClient(apiKey?: string): FirecrawlApp {
   const config: any = {
     ...(process.env.FIRECRAWL_API_URL && {
@@ -163,6 +174,84 @@ function getClient(session?: SessionData): FirecrawlApp {
 
 function asText(data: unknown): string {
   return JSON.stringify(data, null, 2);
+}
+
+const licenseService = getLicenseService();
+
+function getLicenseOptions(args: Record<string, any>): {
+  fetch: boolean;
+  includeLicenses: boolean;
+  stage: LicenseStage;
+  distribution: Distribution;
+  estimatedTokens: number;
+  maxChars: number;
+  paymentMethod: 'account_balance' | 'x402';
+} {
+  return {
+    fetch: Boolean(args.fetch ?? false),
+    includeLicenses: Boolean(args.include_licenses ?? false),
+    stage: (args.stage ?? 'infer') as LicenseStage,
+    distribution: (args.distribution ?? 'private') as Distribution,
+    estimatedTokens: Number(args.estimated_tokens ?? 1500),
+    maxChars: Number(args.max_chars ?? 200000),
+    paymentMethod: (args.payment_method ?? 'account_balance') as 'account_balance' | 'x402'
+  };
+}
+
+function stripLicenseArgs<T extends Record<string, any>>(obj: T): Partial<T> {
+  const cleaned: Partial<T> = { ...obj };
+  delete (cleaned as any).fetch;
+  delete (cleaned as any).include_licenses;
+  delete (cleaned as any).stage;
+  delete (cleaned as any).distribution;
+  delete (cleaned as any).estimated_tokens;
+  delete (cleaned as any).max_chars;
+  delete (cleaned as any).payment_method;
+  return cleaned;
+}
+
+function buildUsageLicense(
+  url: string,
+  license?: LicenseInfo,
+  fetched?: LicensedFetchResult
+): LicenseInfo | undefined {
+  if (license?.license_version_id) return license;
+  if (fetched?.acquire?.license_version_id) {
+    return {
+      url,
+      license_found: true,
+      action: 'allow',
+      license_version_id: fetched.acquire.license_version_id,
+      license_sig: fetched.acquire.license_sig,
+      license_type: 'x402'
+    };
+  }
+  return license;
+}
+
+function extractDocumentText(doc: any): string {
+  if (!doc) return '';
+  if (doc.markdown) return String(doc.markdown);
+  if (doc.html) return String(doc.html);
+  if (doc.rawHtml) return String(doc.rawHtml);
+  if (doc.text) return String(doc.text);
+  if (doc.content) return String(doc.content);
+  if (doc.json) return JSON.stringify(doc.json);
+  if (doc.extract) return JSON.stringify(doc.extract);
+  return '';
+}
+
+async function logUsageFromContent(
+  url: string,
+  content: string,
+  license: LicenseInfo | undefined,
+  stage: LicenseStage,
+  distribution: Distribution
+): Promise<void> {
+  if (!license) return;
+  const tokens = licenseService.estimateTokens(content);
+  if (tokens === 0) return;
+  await licenseService.logUsage(url, tokens, license, stage, distribution);
 }
 
 // scrape tool (v2 semantics, minimal args)
@@ -259,6 +348,13 @@ const scrapeParamsSchema = z.object({
   zeroDataRetention: z.boolean().optional(),
   maxAge: z.number().optional(),
   proxy: z.enum(['basic', 'stealth', 'auto']).optional(),
+  fetch: z.boolean().optional(),
+  include_licenses: z.boolean().optional(),
+  stage: z.enum(['infer', 'embed', 'tune', 'train']).optional(),
+  distribution: z.enum(['private', 'public']).optional(),
+  estimated_tokens: z.number().optional(),
+  max_chars: z.number().optional(),
+  payment_method: z.enum(['account_balance', 'x402']).optional(),
 });
 
 server.addTool({
@@ -296,17 +392,46 @@ ${
     args: unknown,
     { session, log }: { session?: SessionData; log: Logger }
   ): Promise<string> => {
-    const { url, ...options } = args as { url: string } & Record<
-      string,
-      unknown
-    >;
+    const argsObj = args as { url: string } & Record<string, any>;
+    const { url, ...options } = argsObj;
+    const licenseOpts = getLicenseOptions(argsObj);
     const client = getClient(session);
-    const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
+    const cleaned = removeEmptyTopLevel(stripLicenseArgs(options));
     log.info('Scraping URL', { url: String(url) });
     const res = await client.scrape(String(url), {
       ...cleaned,
       origin: ORIGIN,
     } as any);
+    const license = await licenseService.checkLicense(String(url));
+    let fetched: LicensedFetchResult | undefined;
+
+    if (licenseOpts.fetch) {
+      fetched = await licensedFetchText(String(url), {
+        ledger: licenseService,
+        stage: licenseOpts.stage,
+        distribution: licenseOpts.distribution,
+        estimatedTokens: licenseOpts.estimatedTokens,
+        maxChars: licenseOpts.maxChars,
+        paymentMethod: licenseOpts.paymentMethod
+      });
+
+      if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
+        const usageLicense = buildUsageLicense(String(url), license, fetched);
+        await logUsageFromContent(String(url), fetched.content_text, usageLicense, licenseOpts.stage, licenseOpts.distribution);
+      }
+    } else {
+      const content = extractDocumentText((res as any)?.data ?? res);
+      await logUsageFromContent(String(url), content, license, licenseOpts.stage, licenseOpts.distribution);
+    }
+
+    if (licenseOpts.includeLicenses || licenseOpts.fetch) {
+      const payload: any = typeof res === 'object' && res !== null ? { ...(res as any) } : { data: res };
+      payload.license = license;
+      if (licenseOpts.fetch) payload.fetched = fetched;
+      payload.usage_log = licenseService.getSessionSummary();
+      return asText(payload);
+    }
+
     return asText(res);
   },
 });
@@ -432,19 +557,84 @@ The query also supports search operators, that you can use if needed to refine t
       .optional(),
     scrapeOptions: scrapeParamsSchema.omit({ url: true }).partial().optional(),
     enterprise: z.array(z.enum(['default', 'anon', 'zdr'])).optional(),
+    fetch: z.boolean().optional(),
+    include_licenses: z.boolean().optional(),
+    stage: z.enum(['infer', 'embed', 'tune', 'train']).optional(),
+    distribution: z.enum(['private', 'public']).optional(),
+    estimated_tokens: z.number().optional(),
+    max_chars: z.number().optional(),
+    payment_method: z.enum(['account_balance', 'x402']).optional(),
   }),
   execute: async (
     args: unknown,
     { session, log }: { session?: SessionData; log: Logger }
   ): Promise<string> => {
     const client = getClient(session);
-    const { query, ...opts } = args as Record<string, unknown>;
-    const cleaned = removeEmptyTopLevel(opts as Record<string, unknown>);
+    const argsObj = args as Record<string, any>;
+    const { query, ...opts } = argsObj;
+    const licenseOpts = getLicenseOptions(argsObj);
+    const cleaned = removeEmptyTopLevel(stripLicenseArgs(opts));
+    if (cleaned.scrapeOptions) {
+      cleaned.scrapeOptions = removeEmptyTopLevel(stripLicenseArgs(cleaned.scrapeOptions));
+    }
     log.info('Searching', { query: String(query) });
     const res = await client.search(query as string, {
       ...(cleaned as any),
       origin: ORIGIN,
     });
+    const results = (res as any)?.data?.results || (res as any)?.results || [];
+    const urls = results.map((r: any) => r.url).filter(Boolean);
+    const licenses = await licenseService.checkLicenseBatch(urls);
+    const fetchedByUrl: Record<string, LicensedFetchResult> = {};
+
+    if (licenseOpts.fetch) {
+      for (const url of urls) {
+        const fetched = await licensedFetchText(url, {
+          ledger: licenseService,
+          stage: licenseOpts.stage,
+          distribution: licenseOpts.distribution,
+          estimatedTokens: licenseOpts.estimatedTokens,
+          maxChars: licenseOpts.maxChars,
+          paymentMethod: licenseOpts.paymentMethod
+        });
+        fetchedByUrl[url] = fetched;
+
+        if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
+          const usageLicense = buildUsageLicense(url, licenses.get(url), fetched);
+          await logUsageFromContent(url, fetched.content_text, usageLicense, licenseOpts.stage, licenseOpts.distribution);
+        }
+      }
+    } else {
+      for (const resultItem of results) {
+        const license = licenses.get(resultItem.url);
+        if (license) {
+          await logUsageFromContent(
+            resultItem.url,
+            extractDocumentText(resultItem),
+            license,
+            licenseOpts.stage,
+            licenseOpts.distribution
+          );
+        }
+      }
+    }
+
+    if (licenseOpts.includeLicenses || licenseOpts.fetch) {
+      const payload: any = typeof res === 'object' && res !== null ? { ...(res as any) } : { data: res };
+      payload.licenses = results.map((r: any) => {
+        const fetched = fetchedByUrl[r.url];
+        const content = fetched?.content_text || extractDocumentText(r);
+        return {
+          url: r.url,
+          tokens: licenseService.estimateTokens(content),
+          license: licenses.get(r.url),
+          fetched: licenseOpts.fetch ? fetched : undefined
+        };
+      });
+      payload.usage_log = licenseService.getSessionSummary();
+      return asText(payload);
+    }
+
     return asText(res);
   },
 });
@@ -513,7 +703,10 @@ server.addTool({
   execute: async (args, { session, log }) => {
     const { url, ...options } = args as Record<string, unknown>;
     const client = getClient(session);
-    const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
+    const cleaned = removeEmptyTopLevel(stripLicenseArgs(options as Record<string, unknown>));
+    if (cleaned.scrapeOptions) {
+      cleaned.scrapeOptions = removeEmptyTopLevel(stripLicenseArgs(cleaned.scrapeOptions));
+    }
     log.info('Starting crawl', { url: String(url) });
     const res = await client.crawl(String(url), {
       ...(cleaned as any),
@@ -539,13 +732,85 @@ Check the status of a crawl job.
 \`\`\`
 **Returns:** Status and progress of the crawl job, including results if available.
 `,
-  parameters: z.object({ id: z.string() }),
+  parameters: z.object({
+    id: z.string(),
+    fetch: z.boolean().optional(),
+    include_licenses: z.boolean().optional(),
+    stage: z.enum(['infer', 'embed', 'tune', 'train']).optional(),
+    distribution: z.enum(['private', 'public']).optional(),
+    estimated_tokens: z.number().optional(),
+    max_chars: z.number().optional(),
+    payment_method: z.enum(['account_balance', 'x402']).optional(),
+  }),
   execute: async (
     args: unknown,
     { session }: { session?: SessionData }
   ): Promise<string> => {
     const client = getClient(session);
-    const res = await client.getCrawlStatus((args as any).id as string);
+    const argsObj = args as Record<string, any>;
+    const licenseOpts = getLicenseOptions(argsObj);
+    const res = await client.getCrawlStatus(argsObj.id as string);
+
+    const data = (res as any)?.data ?? res;
+    const pages = data?.data?.pages || data?.pages || data?.results || [];
+    if (Array.isArray(pages) && pages.length > 0) {
+      const urls = pages
+        .map((p: any) => p.url || p.metadata?.url)
+        .filter(Boolean);
+      const licenses = await licenseService.checkLicenseBatch(urls);
+      const fetchedByUrl: Record<string, LicensedFetchResult> = {};
+
+      if (licenseOpts.fetch) {
+        for (const url of urls) {
+          const fetched = await licensedFetchText(url, {
+            ledger: licenseService,
+            stage: licenseOpts.stage,
+            distribution: licenseOpts.distribution,
+            estimatedTokens: licenseOpts.estimatedTokens,
+            maxChars: licenseOpts.maxChars,
+            paymentMethod: licenseOpts.paymentMethod
+          });
+          fetchedByUrl[url] = fetched;
+
+          if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
+            const usageLicense = buildUsageLicense(url, licenses.get(url), fetched);
+            await logUsageFromContent(url, fetched.content_text, usageLicense, licenseOpts.stage, licenseOpts.distribution);
+          }
+        }
+      } else {
+        for (const page of pages) {
+          const pageUrl = page.url || page.metadata?.url;
+          const license = licenses.get(pageUrl);
+          if (license) {
+            await logUsageFromContent(
+              pageUrl,
+              extractDocumentText(page),
+              license,
+              licenseOpts.stage,
+              licenseOpts.distribution
+            );
+          }
+        }
+      }
+
+      if (licenseOpts.includeLicenses || licenseOpts.fetch) {
+        const payload: any = typeof res === 'object' && res !== null ? { ...(res as any) } : { data: res };
+        payload.licenses = pages.map((page: any) => {
+          const pageUrl = page.url || page.metadata?.url;
+          const fetched = fetchedByUrl[pageUrl];
+          const content = fetched?.content_text || extractDocumentText(page);
+          return {
+            url: pageUrl,
+            tokens: licenseService.estimateTokens(content),
+            license: licenses.get(pageUrl),
+            fetched: licenseOpts.fetch ? fetched : undefined
+          };
+        });
+        payload.usage_log = licenseService.getSessionSummary();
+        return asText(payload);
+      }
+    }
+
     return asText(res);
   },
 });
@@ -596,13 +861,21 @@ Extract structured information from web pages using LLM capabilities. Supports b
     allowExternalLinks: z.boolean().optional(),
     enableWebSearch: z.boolean().optional(),
     includeSubdomains: z.boolean().optional(),
+    fetch: z.boolean().optional(),
+    include_licenses: z.boolean().optional(),
+    stage: z.enum(['infer', 'embed', 'tune', 'train']).optional(),
+    distribution: z.enum(['private', 'public']).optional(),
+    estimated_tokens: z.number().optional(),
+    max_chars: z.number().optional(),
+    payment_method: z.enum(['account_balance', 'x402']).optional(),
   }),
   execute: async (
     args: unknown,
     { session, log }: { session?: SessionData; log: Logger }
   ): Promise<string> => {
     const client = getClient(session);
-    const a = args as Record<string, unknown>;
+    const a = args as Record<string, any>;
+    const licenseOpts = getLicenseOptions(a);
     log.info('Extracting from URLs', {
       count: Array.isArray(a.urls) ? a.urls.length : 0,
     });
@@ -616,6 +889,61 @@ Extract structured information from web pages using LLM capabilities. Supports b
       origin: ORIGIN,
     });
     const res = await client.extract(extractBody as any);
+    const urls = Array.isArray(a.urls) ? (a.urls as string[]) : [];
+    const licenses = await licenseService.checkLicenseBatch(urls);
+    const fetchedByUrl: Record<string, LicensedFetchResult> = {};
+
+    if (licenseOpts.fetch) {
+      for (const url of urls) {
+        const fetched = await licensedFetchText(url, {
+          ledger: licenseService,
+          stage: licenseOpts.stage,
+          distribution: licenseOpts.distribution,
+          estimatedTokens: licenseOpts.estimatedTokens,
+          maxChars: licenseOpts.maxChars,
+          paymentMethod: licenseOpts.paymentMethod
+        });
+        fetchedByUrl[url] = fetched;
+
+        if (fetched.content_text && fetched.status >= 200 && fetched.status < 300) {
+          const usageLicense = buildUsageLicense(url, licenses.get(url), fetched);
+          await logUsageFromContent(url, fetched.content_text, usageLicense, licenseOpts.stage, licenseOpts.distribution);
+        }
+      }
+    } else {
+      const data = (res as any)?.data ?? res;
+      const results = data?.data || data?.results || [];
+      for (const item of Array.isArray(results) ? results : []) {
+        const itemUrl = item.url || item.sourceUrl;
+        const license = licenses.get(itemUrl);
+        if (license) {
+          await logUsageFromContent(
+            itemUrl,
+            extractDocumentText(item),
+            license,
+            licenseOpts.stage,
+            licenseOpts.distribution
+          );
+        }
+      }
+    }
+
+    if (licenseOpts.includeLicenses || licenseOpts.fetch) {
+      const payload: any = typeof res === 'object' && res !== null ? { ...(res as any) } : { data: res };
+      payload.licenses = urls.map((url: string) => {
+        const fetched = fetchedByUrl[url];
+        const content = fetched?.content_text || '';
+        return {
+          url,
+          tokens: licenseService.estimateTokens(content),
+          license: licenses.get(url),
+          fetched: licenseOpts.fetch ? fetched : undefined
+        };
+      });
+      payload.usage_log = licenseService.getSessionSummary();
+      return asText(payload);
+    }
+
     return asText(res);
   },
 });

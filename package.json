@@ -1,11 +1,11 @@
 {
-  "name": "firecrawl-mcp",
-  "version": "3.7.4",
-  "description": "MCP server for Firecrawl web scraping integration. Supports both cloud and self-hosted instances. Features include web scraping, search, batch processing, structured data extraction, and LLM-powered content analysis.",
+  "name": "firecrawl-mcp-server-licensed",
+  "version": "3.7.4-licensed.1",
+  "description": "Firecrawl MCP server with Copyright.sh licensing, usage logging, and optional x402-aware fetch.",
   "type": "module",
-  "mcpName": "io.github.firecrawl/firecrawl-mcp-server",
+  "mcpName": "io.github.tymrtn/firecrawl-mcp-server-licensed",
   "bin": {
-    "firecrawl-mcp": "dist/index.js"
+    "firecrawl-mcp-server-licensed": "dist/index.js"
   },
   "files": [
     "dist"
@@ -29,8 +29,10 @@
   "license": "MIT",
   "dependencies": {
     "@mendable/firecrawl-js": "^4.9.3",
+    "axios": "^1.6.7",
     "dotenv": "^17.2.2",
     "firecrawl-fastmcp": "^1.0.4",
+    "tiktoken": "^1.0.10",
     "typescript": "^5.9.2",
     "zod": "^4.1.5"
   },
@@ -46,13 +48,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/firecrawl/firecrawl-mcp-server.git"
+    "url": "git+https://github.com/tymrtn/firecrawl-mcp-server-licensed.git"
   },
-  "author": "firecrawl",
+  "author": "firecrawl + Copyright.sh",
   "bugs": {
-    "url": "https://github.com/firecrawl/firecrawl-mcp-server/issues"
+    "url": "https://github.com/tymrtn/firecrawl-mcp-server-licensed/issues"
   },
-  "homepage": "https://github.com/firecrawl/firecrawl-mcp-server#readme",
+  "homepage": "https://github.com/tymrtn/firecrawl-mcp-server-licensed#readme",
   "devDependencies": {
     "@types/node": "^24.3.1"
   }
