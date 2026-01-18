@@ -29,6 +29,10 @@ When following upstream install instructions, replace `firecrawl-mcp` with `fire
 License-aware options (for scrape/search/extract/check_crawl_status):
 - `fetch`, `include_licenses`, `stage`, `distribution`, `estimated_tokens`, `max_chars`, `payment_method`
 
+Unavailable policy:
+- License denied or HTTP 401/403/402 results are returned as unavailable
+- Unknown license remains best-effort
+
 > Big thanks to [@vrknetha](https://github.com/vrknetha), [@knacklabs](https://www.knacklabs.ai) for the initial implementation!
 
 ## Features
