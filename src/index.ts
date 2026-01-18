@@ -253,8 +253,8 @@ function extractDocumentText(doc: any): string {
   return '';
 }
 
-function redactResultFields<T extends Record<string, any>>(item: T, reason: string): T {
-  const cleaned: T = { ...item, unavailable: reason };
+function redactResultFields(item: Record<string, any>, reason: string): Record<string, any> {
+  const cleaned: Record<string, any> = { ...item, unavailable: reason };
   const fields = ['markdown', 'html', 'rawHtml', 'text', 'content'];
   for (const field of fields) {
     if (field in cleaned) {
